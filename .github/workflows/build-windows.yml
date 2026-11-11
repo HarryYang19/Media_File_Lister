@@ -1,0 +1,110 @@
+name: Build Windows portable ZIP
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x64:
+    name: Windows 10/11 x64 portable package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10 SDK (build machine only)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download official metadata tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $project = Join-Path $env:GITHUB_WORKSPACE 'src\MediaFileLister'
+          $tools = Join-Path $project 'tools'
+          $exifDir = Join-Path $tools 'ExifTool'
+          $miDir = Join-Path $tools 'MediaInfo'
+          New-Item -ItemType Directory -Force -Path $exifDir, $miDir | Out-Null
+
+          # ExifTool official Windows x64 executable package.
+          $exifZip = Join-Path $env:RUNNER_TEMP 'exiftool-13.59_64.zip'
+          Invoke-WebRequest -Uri 'https://exiftool.org/exiftool-13.59_64.zip' -OutFile $exifZip
+          Expand-Archive -LiteralPath $exifZip -DestinationPath $exifDir -Force
+          $exifExe = Get-ChildItem -Path $exifDir -Recurse -File | Where-Object { $_.Name -eq 'exiftool(-k).exe' -or $_.Name -eq 'exiftool.exe' } | Select-Object -First 1
+          if (-not $exifExe) { throw 'ExifTool executable was not found in the official archive.' }
+          if ($exifExe.Name -ne 'exiftool.exe') {
+            Rename-Item -LiteralPath $exifExe.FullName -NewName 'exiftool.exe'
+          }
+
+          # MediaInfo official Windows x64 CLI package (not the GUI installer).
+          $miZip = Join-Path $env:RUNNER_TEMP 'MediaInfo_CLI_26.10_Windows_x64.zip'
+          Invoke-WebRequest -Uri 'https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Windows_x64.zip' -OutFile $miZip
+          Expand-Archive -LiteralPath $miZip -DestinationPath $miDir -Force
+          $miExe = Get-ChildItem -Path $miDir -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
+          if (-not $miExe) { throw 'MediaInfo CLI executable was not found in the official archive.' }
+
+          # Include third-party license texts in the end-user package.
+          $licenseDir = Join-Path $project 'LICENSES'
+          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Perl/perl5/blead/Artistic' -OutFile (Join-Path $licenseDir 'Artistic-1.0-Perl.txt')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/MediaArea/MediaInfo/v26.10/LICENSE' -OutFile (Join-Path $licenseDir 'MediaInfo-BSD-2-Clause.txt')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/LICENSE.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-MIT-LICENSE.txt')
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/THIRD-PARTY-NOTICES.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-THIRD-PARTY-NOTICES.txt')
+
+          Write-Host "ExifTool: $((& $exifExe.FullName -ver | Out-String).Trim())"
+          Write-Host "MediaInfo: $((& $miExe.FullName --Version | Out-String).Trim())"
+
+      - name: Publish self-contained Windows application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $project = Join-Path $env:GITHUB_WORKSPACE 'src\MediaFileLister\MediaFileLister.csproj'
+          $publish = Join-Path $env:GITHUB_WORKSPACE 'publish'
+          dotnet publish $project -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $publish
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+          if (-not (Test-Path (Join-Path $publish '媒体文件清单.exe'))) { throw 'The self-contained application EXE was not produced.' }
+          $bundledExif = Get-ChildItem -Path (Join-Path $publish 'tools') -Recurse -File -Filter 'exiftool.exe' | Select-Object -First 1
+          $bundledMediaInfo = Get-ChildItem -Path (Join-Path $publish 'tools') -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
+          if (-not $bundledExif -or -not $bundledMediaInfo) { throw 'Metadata tools were not copied into the publish folder.' }
+          Write-Host "Published ExifTool: $((& $bundledExif.FullName -ver | Out-String).Trim())"
+          Write-Host "Published MediaInfo: $((& $bundledMediaInfo.FullName --Version | Out-String).Trim())"
+
+          # Copy notices next to the executable. Keep the helper folders as part of the ZIP.
+          $licenseSource = Join-Path $env:GITHUB_WORKSPACE 'src\MediaFileLister\LICENSES'
+          Copy-Item -Path $licenseSource -Destination $publish -Recurse -Force
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'THIRD-PARTY-NOTICES.md') -Destination $publish -Force
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'LICENSE') -Destination $publish -Force
+          Copy-Item -Path (Join-Path $env:GITHUB_WORKSPACE 'README.md') -Destination $publish -Force
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE '媒体文件清单-Windows-x64-便携版.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "Created $zip"
+          Get-Item $zip | Format-List Name, Length
+
+      - name: Upload portable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaFileLister-Windows-x64
+          path: 媒体文件清单-Windows-x64-便携版.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach ZIP to GitHub Release when a version tag is pushed
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 媒体文件清单-Windows-x64-便携版.zip
+          generate_release_notes: true
+
