@@ -7,8 +7,8 @@ This application bundles unmodified third-party command-line tools in its Window
 - Author: Phil Harvey
 - Website: <https://exiftool.org/>
 - Source: <https://github.com/exiftool/exiftool>
-- Windows executable distribution: <https://exiftool.org/install.html>
-- Version used by the build workflow: 13.59
+- Windows executable distribution: <https://sourceforge.net/projects/exiftool/files/> (official project download mirror)
+- Version used by the build workflow: 13.63
 - License: dual-licensed under the same terms as Perl (GNU GPL or Perl Artistic License). This distribution includes the Perl Artistic License text in `LICENSES/Artistic-1.0-Perl.txt` and elects to rely on that license for the bundled ExifTool distribution, subject to its terms.
 
 ## MediaInfo CLI

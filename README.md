@@ -40,7 +40,7 @@
 
 GitHub Actions 会从官方地址下载并打包：
 
-- ExifTool 13.59 Windows x64：<https://exiftool.org/>
+- ExifTool 13.63 Windows x64：<https://sourceforge.net/projects/exiftool/files/>（官方项目现将二进制下载托管于 SourceForge）
 - MediaInfo CLI 26.10 Windows x64：<https://mediaarea.net/MediaInfo/Download/Windows>
 
 下载的工具放在 `src/MediaFileLister/tools/`，通过 `.csproj` 发布设置复制到输出目录。工具文件没有提交进源代码仓库，避免把体积较大的第三方二进制提交到 Git 历史中。
