@@ -33,13 +33,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path $exifDir, $miDir | Out-Null
 
           # ExifTool official Windows x64 executable package.
-          $exifZip = Join-Path $env:RUNNER_TEMP 'exiftool-13.59_64.zip'
-          Invoke-WebRequest -Uri 'https://exiftool.org/exiftool-13.59_64.zip' -OutFile $exifZip
+          # The project moved binary downloads from exiftool.org to SourceForge;
+          # the old exiftool.org direct URL returns HTTP 404.
+          $exifVersion = '13.63'
+          $exifFile = "exiftool-$($exifVersion)_64.zip"
+          $exifZip = Join-Path $env:RUNNER_TEMP $exifFile
+          $exifUrl = "https://downloads.sourceforge.net/project/exiftool/$exifFile"
+          Invoke-WebRequest -Uri $exifUrl -OutFile $exifZip -MaximumRedirection 10
+          if (-not (Test-Path $exifZip) -or (Get-Item $exifZip).Length -lt 1000000) { throw "ExifTool download looks invalid: $exifUrl" }
           Expand-Archive -LiteralPath $exifZip -DestinationPath $exifDir -Force
           $exifExe = Get-ChildItem -Path $exifDir -Recurse -File | Where-Object { $_.Name -eq 'exiftool(-k).exe' -or $_.Name -eq 'exiftool.exe' } | Select-Object -First 1
           if (-not $exifExe) { throw 'ExifTool executable was not found in the official archive.' }
           if ($exifExe.Name -ne 'exiftool.exe') {
+            $exifExeDirectory = $exifExe.DirectoryName
             Rename-Item -LiteralPath $exifExe.FullName -NewName 'exiftool.exe'
+            $exifExe = Get-Item (Join-Path $exifExeDirectory 'exiftool.exe')
           }
 
           # MediaInfo official Windows x64 CLI package (not the GUI installer).
@@ -57,8 +65,14 @@ jobs:
           Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/LICENSE.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-MIT-LICENSE.txt')
           Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/THIRD-PARTY-NOTICES.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-THIRD-PARTY-NOTICES.txt')
 
-          Write-Host "ExifTool: $((& $exifExe.FullName -ver | Out-String).Trim())"
-          Write-Host "MediaInfo: $((& $miExe.FullName --Version | Out-String).Trim())"
+          $exifReportedVersion = (& $exifExe.FullName -ver | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $exifReportedVersion) { throw 'ExifTool self-test failed.' }
+          if ($exifReportedVersion -ne $exifVersion) { throw "Unexpected ExifTool version: $exifReportedVersion (expected $exifVersion)." }
+          Write-Host "ExifTool: $exifReportedVersion"
+          $miReportedVersion = (& $miExe.FullName --Version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $miReportedVersion) { throw 'MediaInfo self-test failed.' }
+          if ($miReportedVersion -notmatch '26\.10') { throw "Unexpected MediaInfo version: $miReportedVersion (expected 26.10)." }
+          Write-Host "MediaInfo: $miReportedVersion"
 
       - name: Publish self-contained Windows application
         shell: pwsh
