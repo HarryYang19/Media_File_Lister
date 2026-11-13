@@ -38,12 +38,14 @@
 
 项目使用 C# / Windows Forms / .NET 10，当前工作流目标是 `win-x64`。构建机由 GitHub Actions 安装 .NET 10 SDK，并以 self-contained 单文件方式发布；最终用户不需要安装 .NET Runtime。
 
-GitHub Actions 会从官方地址下载并打包：
+GitHub Actions 会下载并打包以下固定版本：
 
-- ExifTool 13.63 Windows x64：<https://sourceforge.net/projects/exiftool/files/>（官方项目现将二进制下载托管于 SourceForge）
-- MediaInfo CLI 26.10 Windows x64：<https://mediaarea.net/MediaInfo/Download/Windows>
+- ExifTool 13.63 Windows x64：官方项目页 <https://exiftool.sourceforge.net/>；官方下载目录 <https://sourceforge.net/projects/exiftool/files/>。
+- MediaInfo CLI 26.10 Windows x64：MediaArea 官方 Windows 下载页 <https://mediaarea.net/en/MediaInfo/Download/Windows>；构建使用该页面对应的 CLI ZIP。
 
-下载的工具放在 `src/MediaFileLister/tools/`，通过 `.csproj` 发布设置复制到输出目录。工具文件没有提交进源代码仓库，避免把体积较大的第三方二进制提交到 Git 历史中。
+**下载可靠性与完整性校验：** ExifTool 的 SourceForge 发行文件在官方文件页公布 SHA-256：`7a4bff4b1d6ee15adef882837847f76c0ed23228d294feed285939b6c9b293bd`。工作流依次尝试多个 SourceForge 镜像和官方自动镜像地址；每次下载后先检查 ZIP 文件头、大小，再比对完整 SHA-256，只有完全匹配才会解压。MediaInfo CLI ZIP 同样固定 SHA-256：`4cc94bd272903914c04f4f9a9f53a6c94b5ea6c6454cf738d29fa182c41e8a29`（与 26.10 Windows x64 CLI 包的验证记录一致），失败时会重试，哈希不一致则立即终止。这样即使镜像返回 HTML 错误页，也不会误当作压缩包继续构建。
+
+下载的工具放在 `src/MediaFileLister/tools/`，通过 `.csproj` 发布设置复制到输出目录。工具文件没有提交进源代码仓库，避免把体积较大的第三方二进制提交到 Git 历史中。工作流还会检查 ExifTool 配套的 `exiftool_files` 目录，以及两个命令行程序的实际版本号。
 
 ## 系统与限制
 
