@@ -22,57 +22,158 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Download official metadata tools
+      - name: Download and verify metadata tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
           $project = Join-Path $env:GITHUB_WORKSPACE 'src\MediaFileLister'
           $tools = Join-Path $project 'tools'
           $exifDir = Join-Path $tools 'ExifTool'
           $miDir = Join-Path $tools 'MediaInfo'
           New-Item -ItemType Directory -Force -Path $exifDir, $miDir | Out-Null
 
-          # ExifTool official Windows x64 executable package.
-          # The project moved binary downloads from exiftool.org to SourceForge;
-          # the old exiftool.org direct URL returns HTTP 404.
+          function Get-VerifiedZip {
+            param(
+              [Parameter(Mandatory=$true)][string]$Name,
+              [Parameter(Mandatory=$true)][string[]]$Urls,
+              [Parameter(Mandatory=$true)][string]$OutFile,
+              [Parameter(Mandatory=$true)][string]$ExpectedSha256,
+              [Parameter(Mandatory=$true)][long]$MinimumBytes
+            )
+
+            $failures = [System.Collections.Generic.List[string]]::new()
+            foreach ($url in $Urls) {
+              if (Test-Path $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
+              try {
+                Write-Host "Downloading $Name from: $url"
+                Invoke-WebRequest -Uri $url -OutFile $OutFile -MaximumRedirection 15 -TimeoutSec 240 `
+                  -UserAgent 'MediaFileLister-GitHubActions/1.0' -ErrorAction Stop
+
+                if (-not (Test-Path $OutFile)) { throw 'The server returned without creating a file.' }
+                $item = Get-Item -LiteralPath $OutFile
+                if ($item.Length -lt $MinimumBytes) { throw "Downloaded file is too small ($($item.Length) bytes; expected at least $MinimumBytes)." }
+
+                $stream = [System.IO.File]::OpenRead($OutFile)
+                try {
+                  $magic = New-Object byte[] 4
+                  $read = $stream.Read($magic, 0, 4)
+                } finally { $stream.Dispose() }
+                if ($read -ne 4 -or $magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) {
+                  $allBytes = [System.IO.File]::ReadAllBytes($OutFile)
+                  $sampleLength = [Math]::Min(200, $allBytes.Length)
+                  $sample = [System.Text.Encoding]::UTF8.GetString($allBytes, 0, $sampleLength)
+                  $sample = ($sample -replace '[\r\n\t]+', ' ').Trim()
+                  throw "Response is not a ZIP file. First bytes/text: $sample"
+                }
+
+                $actualHash = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actualHash -ne $ExpectedSha256.ToLowerInvariant()) {
+                  throw "SHA-256 mismatch. Expected $ExpectedSha256, received $actualHash."
+                }
+
+                Write-Host "$Name verified: $($item.Length) bytes; SHA-256 $actualHash"
+                return $OutFile
+              }
+              catch {
+                $detail = $_.Exception.Message
+                if (Test-Path $OutFile) {
+                  $partial = Get-Item -LiteralPath $OutFile
+                  $detail += " Actual size: $($partial.Length) bytes."
+                  Remove-Item -LiteralPath $OutFile -Force
+                }
+                $failures.Add("$url -> $detail")
+                Write-Warning "$Name download attempt failed: $detail"
+                Start-Sleep -Seconds 2
+              }
+            }
+            throw ("Could not obtain a verified $Name archive from any source:`n" + ($failures -join "`n"))
+          }
+
+          function Get-VerifiedTextFile {
+            param([string]$Url, [string]$OutFile, [string]$MustContain)
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -MaximumRedirection 10 -TimeoutSec 120 `
+              -UserAgent 'MediaFileLister-GitHubActions/1.0' -ErrorAction Stop
+            if (-not (Test-Path $OutFile)) { throw "License file was not downloaded: $Url" }
+            $text = [System.IO.File]::ReadAllText($OutFile)
+            if ($text.Length -lt 100 -or -not $text.Contains($MustContain)) {
+              Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+              throw "License URL did not return the expected plain-text license: $Url"
+            }
+          }
+
+          # ExifTool official Windows x64 archive. SourceForge publishes the SHA-256
+          # on the official project download page. Several official mirrors are tried
+          # because SourceForge can return an HTML interstitial or an unavailable mirror.
           $exifVersion = '13.63'
           $exifFile = "exiftool-$($exifVersion)_64.zip"
           $exifZip = Join-Path $env:RUNNER_TEMP $exifFile
-          $exifUrl = "https://downloads.sourceforge.net/project/exiftool/$exifFile"
-          Invoke-WebRequest -Uri $exifUrl -OutFile $exifZip -MaximumRedirection 10
-          if (-not (Test-Path $exifZip) -or (Get-Item $exifZip).Length -lt 1000000) { throw "ExifTool download looks invalid: $exifUrl" }
+          $exifSha256 = '7a4bff4b1d6ee15adef882837847f76c0ed23228d294feed285939b6c9b293bd'
+          $exifUrls = @(
+            "https://pilotfiber.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://phoenixnap.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://netix.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://gigenet.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://cfhcable.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://psychz.dl.sourceforge.net/project/exiftool/$exifFile",
+            "https://downloads.sourceforge.net/project/exiftool/$exifFile",
+            "https://sourceforge.net/projects/exiftool/files/$exifFile/download"
+          )
+          Get-VerifiedZip -Name "ExifTool $exifVersion x64" -Urls $exifUrls -OutFile $exifZip `
+            -ExpectedSha256 $exifSha256 -MinimumBytes 10000000 | Out-Null
+
           Expand-Archive -LiteralPath $exifZip -DestinationPath $exifDir -Force
-          $exifExe = Get-ChildItem -Path $exifDir -Recurse -File | Where-Object { $_.Name -eq 'exiftool(-k).exe' -or $_.Name -eq 'exiftool.exe' } | Select-Object -First 1
-          if (-not $exifExe) { throw 'ExifTool executable was not found in the official archive.' }
-          if ($exifExe.Name -ne 'exiftool.exe') {
-            $exifExeDirectory = $exifExe.DirectoryName
-            Rename-Item -LiteralPath $exifExe.FullName -NewName 'exiftool.exe'
-            $exifExe = Get-Item (Join-Path $exifExeDirectory 'exiftool.exe')
+          $exifExe = Get-ChildItem -Path $exifDir -Recurse -File | Where-Object {
+            $_.Name -eq 'exiftool(-k).exe' -or $_.Name -eq 'exiftool.exe'
+          } | Select-Object -First 1
+          if (-not $exifExe) { throw 'Verified ExifTool archive contains no exiftool(-k).exe / exiftool.exe.' }
+          $exifExeDirectory = $exifExe.DirectoryName
+          $exifFilesDir = Join-Path $exifExeDirectory 'exiftool_files'
+          if (-not (Test-Path $exifFilesDir -PathType Container)) {
+            throw "ExifTool support folder is missing next to its executable: $exifFilesDir"
           }
+          if ($exifExe.Name -ne 'exiftool.exe') {
+            Rename-Item -LiteralPath $exifExe.FullName -NewName 'exiftool.exe'
+          }
+          $exifExe = Get-Item -LiteralPath (Join-Path $exifExeDirectory 'exiftool.exe')
 
-          # MediaInfo official Windows x64 CLI package (not the GUI installer).
-          $miZip = Join-Path $env:RUNNER_TEMP 'MediaInfo_CLI_26.10_Windows_x64.zip'
-          Invoke-WebRequest -Uri 'https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Windows_x64.zip' -OutFile $miZip
+          # MediaInfo official CLI archive. SHA-256 is pinned to the published
+          # 26.10 Windows x64 package verification value.
+          $miVersion = '26.10'
+          $miZip = Join-Path $env:RUNNER_TEMP "MediaInfo_CLI_$($miVersion)_Windows_x64.zip"
+          $miUrl = "https://mediaarea.net/download/binary/mediainfo/$miVersion/MediaInfo_CLI_$($miVersion)_Windows_x64.zip"
+          $miSha256 = '4cc94bd272903914c04f4f9a9f53a6c94b5ea6c6454cf738d29fa182c41e8a29'
+          Get-VerifiedZip -Name "MediaInfo CLI $miVersion x64" -Urls @($miUrl, $miUrl, $miUrl) `
+            -OutFile $miZip -ExpectedSha256 $miSha256 -MinimumBytes 500000 | Out-Null
           Expand-Archive -LiteralPath $miZip -DestinationPath $miDir -Force
-          $miExe = Get-ChildItem -Path $miDir -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
-          if (-not $miExe) { throw 'MediaInfo CLI executable was not found in the official archive.' }
+          $miExe = Get-ChildItem -Path $miDir -Recurse -File | Where-Object {
+            $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe'
+          } | Select-Object -First 1
+          if (-not $miExe) { throw 'Verified MediaInfo CLI archive contains no MediaInfo.exe.' }
 
-          # Include third-party license texts in the end-user package.
+          # Include the exact upstream license texts in the end-user package.
           $licenseDir = Join-Path $project 'LICENSES'
           New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
-          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Perl/perl5/blead/Artistic' -OutFile (Join-Path $licenseDir 'Artistic-1.0-Perl.txt')
-          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/MediaArea/MediaInfo/v26.10/LICENSE' -OutFile (Join-Path $licenseDir 'MediaInfo-BSD-2-Clause.txt')
-          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/LICENSE.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-MIT-LICENSE.txt')
-          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/THIRD-PARTY-NOTICES.TXT' -OutFile (Join-Path $licenseDir 'dotnet-runtime-THIRD-PARTY-NOTICES.txt')
+          Get-VerifiedTextFile 'https://raw.githubusercontent.com/Perl/perl5/blead/Artistic' `
+            (Join-Path $licenseDir 'Artistic-1.0-Perl.txt') 'The "Artistic License"'
+          Get-VerifiedTextFile 'https://raw.githubusercontent.com/MediaArea/MediaInfo/v26.10/LICENSE' `
+            (Join-Path $licenseDir 'MediaInfo-BSD-2-Clause.txt') 'BSD 2-Clause License'
+          Get-VerifiedTextFile 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/LICENSE.TXT' `
+            (Join-Path $licenseDir 'dotnet-runtime-MIT-LICENSE.txt') 'The MIT License (MIT)'
+          Get-VerifiedTextFile 'https://raw.githubusercontent.com/dotnet/runtime/release/10.0/THIRD-PARTY-NOTICES.TXT' `
+            (Join-Path $licenseDir 'dotnet-runtime-THIRD-PARTY-NOTICES.txt') 'third-party libraries'
 
           $exifReportedVersion = (& $exifExe.FullName -ver | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not $exifReportedVersion) { throw 'ExifTool self-test failed.' }
-          if ($exifReportedVersion -ne $exifVersion) { throw "Unexpected ExifTool version: $exifReportedVersion (expected $exifVersion)." }
-          Write-Host "ExifTool: $exifReportedVersion"
-          $miReportedVersion = (& $miExe.FullName --Version | Out-String).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not $miReportedVersion) { throw 'MediaInfo self-test failed.' }
-          if ($miReportedVersion -notmatch '26\.10') { throw "Unexpected MediaInfo version: $miReportedVersion (expected 26.10)." }
-          Write-Host "MediaInfo: $miReportedVersion"
+          if ($LASTEXITCODE -ne 0 -or $exifReportedVersion -ne $exifVersion) {
+            throw "ExifTool self-test failed. Reported version: '$exifReportedVersion'; expected '$exifVersion'."
+          }
+          Write-Host "ExifTool self-test passed: $exifReportedVersion"
+
+          $miReportedVersion = (& $miExe.FullName --Version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $miReportedVersion -notmatch [regex]::Escape($miVersion)) {
+            throw "MediaInfo self-test failed. Reported version: '$miReportedVersion'; expected '$miVersion'."
+          }
+          Write-Host "MediaInfo self-test passed: $miReportedVersion"
 
       - name: Publish self-contained Windows application
         shell: pwsh
