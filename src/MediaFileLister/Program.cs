@@ -227,6 +227,10 @@ internal sealed record ScanProgress(int Completed, int Total, string Message, st
 internal sealed record FileEntry(string FileName, string RelativePath, string Category, string Detail, string Extension, long SizeBytes);
 internal sealed record ScanResult(List<FileEntry> Files, string TxtPath, string CsvPath, int AudioCount, int PhotoCount, int VideoCount, int OtherCount);
 internal sealed record ProcessResult(int ExitCode, string StdOut, string StdErr, bool TimedOut);
+internal sealed record MetadataReadResult(
+    Dictionary<string, Dictionary<string, JsonElement>> Records,
+    int FilesReturned,
+    List<string> Diagnostics);
 
 internal static class ScanService
 {
@@ -249,11 +253,18 @@ internal static class ScanService
         ".m2v", ".rm", ".rmvb", ".y4m", ".dv", ".wtv", ".f4v", ".mpe", ".mpv", ".roq"
     };
 
+    // These are Windows Explorer-facing music fields plus common photo author fields.
+    // Time:All is requested as a group so that less-common date tag variants are not missed.
     private static readonly string[] ExifTags =
     {
-        "-Artist", "-Album", "-AlbumArtist", "-Performer", "-Composer", "-Conductor",
-        "-DateTimeOriginal", "-SubSecDateTimeOriginal", "-CreateDate", "-DateTimeDigitized",
-        "-MediaCreateDate", "-DateCreated", "-OffsetTimeOriginal"
+        // Audio contributor / album artist aliases seen in ID3, MP4 and Vorbis comments.
+        "-Artist", "-Artists", "-Performer", "-InterpretedBy", "-OriginalArtist",
+        "-AlbumArtist", "-Band", "-Album", "-Composer", "-Conductor",
+        // Photo authorship and dates. Time:All covers the remaining EXIF/IPTC/XMP/QuickTime time tags.
+        "-Creator", "-By-line", "-Author", "-XPAuthor", "-Credit",
+        "-DateCreated", "-TimeCreated", "-DateTimeCreated", "-DigitalCreationDateTime",
+        "-SubSecDateTimeOriginal", "-DateTimeOriginal", "-CreateDate", "-DateTimeDigitized", "-DateTime",
+        "-Time:All"
     };
 
     public static ScanResult Run(string folder, bool recursive, IProgress<ScanProgress> progress)
@@ -284,7 +295,21 @@ internal static class ScanService
         var exifFiles = audioFiles.Concat(photoFiles).ToList();
 
         progress.Report(new ScanProgress(0, Math.Max(files.Count, 1), $"已找到 {files.Count:N0} 个文件，正在读取音频与照片元数据…"));
-        var exifData = ReadExifMetadata(exifFiles, exifTool, progress, files.Count);
+        var metadata = ReadExifMetadata(exifFiles, exifTool, progress, files.Count);
+        var exifData = metadata.Records;
+
+        int audioWithArtist = audioFiles.Count(path => HasAnyTag(exifData, path, "Artist", "Artists"));
+        int photoWithCaptureTime = photoFiles.Count(path => HasAnyTag(exifData, path,
+            "SubSecDateTimeOriginal", "DateTimeOriginal", "CreateDate", "DateTimeDigitized", "DateTime",
+            "DateCreated", "DigitalCreationDateTime", "TimeCreated", "DateTimeCreated"));
+        int photoWithAuthor = photoFiles.Count(path => HasAnyTag(exifData, path,
+            "Artist", "Creator", "By-line", "Author", "XPAuthor", "Credit"));
+        var metadataSummary = $"音频参与创作的艺术家 {audioWithArtist}/{audioFiles.Count}；照片拍摄时间 {photoWithCaptureTime}/{photoFiles.Count}；照片作者 {photoWithAuthor}/{photoFiles.Count}";
+        progress.Report(new ScanProgress(0, Math.Max(files.Count, 1),
+            $"元数据读取：{metadataSummary}",
+            $"元数据统计：ExifTool 返回 {metadata.FilesReturned}/{exifFiles.Count} 个文件记录；{metadataSummary}"));
+        foreach (var diagnostic in metadata.Diagnostics.Take(5))
+            progress.Report(new ScanProgress(0, Math.Max(files.Count, 1), "元数据读取出现警告。", "ExifTool：" + diagnostic));
 
         var entries = new List<FileEntry>(files.Count);
         int completed = 0;
@@ -313,7 +338,8 @@ internal static class ScanService
 
         var txtPath = Path.Combine(folder, "文件清单.txt");
         var csvPath = Path.Combine(folder, "文件清单.csv");
-        WriteTextReport(txtPath, folder, entries);
+        WriteTextReport(txtPath, folder, entries, metadata.FilesReturned, exifFiles.Count,
+            metadataSummary, metadata.Diagnostics);
         WriteCsvReport(csvPath, entries);
         progress.Report(new ScanProgress(Math.Max(files.Count, 1), Math.Max(files.Count, 1), "报告写入完成。", "已生成 TXT 与 CSV 文件。"));
 
@@ -340,68 +366,235 @@ internal static class ScanService
         catch { return null; }
     }
 
-    private static Dictionary<string, Dictionary<string, JsonElement>> ReadExifMetadata(
+    private static MetadataReadResult ReadExifMetadata(
         List<string> paths, string exifTool, IProgress<ScanProgress> progress, int totalFiles)
     {
         var result = new Dictionary<string, Dictionary<string, JsonElement>>(StringComparer.OrdinalIgnoreCase);
+        var diagnostics = new List<string>();
+        if (paths.Count == 0) return new MetadataReadResult(result, 0, diagnostics);
+
         for (var start = 0; start < paths.Count; start += 25)
         {
             var batch = paths.Skip(start).Take(25).ToList();
+            // The Windows ExifTool build does not reliably receive non-ASCII filenames
+            // passed directly through CreateProcess. Feed a UTF-8 argument stream instead.
+            // ExifTool's documentation specifically recommends UTF-8 argument files on Windows.
             var args = new List<string>
             {
-                "-json", "-G1", "-s", "-api", "LargeFileSupport=1",
-                "-charset", "filename=UTF8", "-charset", "exiftool=UTF8"
+                "-json", "-G1", "-s", "-a", "-api", "LargeFileSupport=1",
+                "-charset", "exiftool=UTF8"
             };
             args.AddRange(ExifTags);
             args.Add("--");
             args.AddRange(batch);
-            var process = RunProcess(exifTool, args, 120_000);
-            if (!string.IsNullOrWhiteSpace(process.StdOut))
+
+            var process = RunExifToolBatch(exifTool, args, 120_000);
+            if (process.TimedOut)
             {
-                try
-                {
-                    using var doc = JsonDocument.Parse(process.StdOut);
-                    if (doc.RootElement.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var item in doc.RootElement.EnumerateArray())
-                        {
-                            if (item.ValueKind != JsonValueKind.Object) continue;
-                            if (!TryGetProperty(item, "SourceFile", out var source)) continue;
-                            var sourcePath = source.GetString();
-                            if (string.IsNullOrWhiteSpace(sourcePath)) continue;
-                            var record = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
-                            foreach (var prop in item.EnumerateObject()) record[prop.Name] = prop.Value.Clone();
-                            result[NormalPath(sourcePath)] = record;
-                        }
-                    }
-                }
-                catch (JsonException)
-                {
-                    progress.Report(new ScanProgress(0, Math.Max(totalFiles, 1), "ExifTool 返回了无法解析的数据，部分文件可能缺少元数据。"));
-                }
+                diagnostics.Add($"批次 {start / 25 + 1} 读取超时（{batch.Count} 个文件）。");
+                continue;
             }
+            if (string.IsNullOrWhiteSpace(process.StdOut))
+            {
+                var detail = TrimDiagnostic(process.StdErr);
+                diagnostics.Add($"批次 {start / 25 + 1} 未返回 JSON，退出码 {process.ExitCode}" +
+                    (string.IsNullOrWhiteSpace(detail) ? "。" : $"；错误：{detail}"));
+                continue;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(process.StdOut);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                {
+                    diagnostics.Add($"批次 {start / 25 + 1} 返回的 JSON 顶层不是数组。");
+                    continue;
+                }
+
+                int batchReturned = 0;
+                foreach (var item in doc.RootElement.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object) continue;
+                    if (!TryGetSourceFile(item, out var sourcePath)) continue;
+                    var record = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var prop in item.EnumerateObject()) record[prop.Name] = prop.Value.Clone();
+                    result[NormalPath(sourcePath)] = record;
+                    var errorText = ReadError(record);
+                    if (!string.IsNullOrWhiteSpace(errorText))
+                        diagnostics.Add($"{Path.GetFileName(sourcePath)}：{errorText}");
+                    batchReturned++;
+                }
+
+                if (batchReturned == 0)
+                    diagnostics.Add($"批次 {start / 25 + 1} 返回了 JSON，但没有包含 SourceFile 文件记录。");
+                else if (batchReturned < batch.Count)
+                    diagnostics.Add($"批次 {start / 25 + 1} 只返回 {batchReturned}/{batch.Count} 个文件记录；请检查 ExifTool 对个别文件的读取错误。" +
+                        (string.IsNullOrWhiteSpace(process.StdErr) ? "" : " " + TrimDiagnostic(process.StdErr)));
+                if (process.ExitCode != 0 && !string.IsNullOrWhiteSpace(process.StdErr))
+                    diagnostics.Add($"批次 {start / 25 + 1} 退出码 {process.ExitCode}：{TrimDiagnostic(process.StdErr)}");
+            }
+            catch (JsonException ex)
+            {
+                diagnostics.Add($"批次 {start / 25 + 1} 的 JSON 无法解析：{ex.Message}；错误输出：{TrimDiagnostic(process.StdErr)}");
+            }
+
             var done = Math.Min(start + batch.Count, paths.Count);
             progress.Report(new ScanProgress(0, Math.Max(totalFiles, 1), $"正在读取媒体标签：{done:N0}/{paths.Count:N0}"));
         }
-        return result;
+
+        return new MetadataReadResult(result, result.Count, diagnostics);
+    }
+
+    private static ProcessResult RunExifToolBatch(string executable, IReadOnlyList<string> arguments, int timeoutMs)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardInputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            WorkingDirectory = Path.GetDirectoryName(executable) ?? AppContext.BaseDirectory
+        };
+        // Must precede -@ so ExifTool interprets subsequent file names as UTF-8.
+        start.ArgumentList.Add("-charset");
+        start.ArgumentList.Add("filename=UTF8");
+        start.ArgumentList.Add("-@");
+        start.ArgumentList.Add("-");
+
+        using var process = new Process { StartInfo = start };
+        try
+        {
+            if (!process.Start()) return new ProcessResult(-1, "", "无法启动 ExifTool。", false);
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            try
+            {
+                foreach (var argument in arguments)
+                    process.StandardInput.WriteLine(argument);
+                process.StandardInput.Close();
+            }
+            catch (IOException)
+            {
+                // The process may have exited early; collect its actual output below.
+            }
+
+            if (!process.WaitForExit(timeoutMs))
+            {
+                try { process.Kill(true); } catch { }
+                return new ProcessResult(124, "", "处理超时。", true);
+            }
+            Task.WaitAll(stdoutTask, stderrTask);
+            return new ProcessResult(process.ExitCode, stdoutTask.Result, stderrTask.Result, false);
+        }
+        catch (Exception ex)
+        {
+            return new ProcessResult(-1, "", ex.Message, false);
+        }
+    }
+
+    private static bool TryGetSourceFile(JsonElement item, out string sourcePath)
+    {
+        foreach (var property in item.EnumerateObject())
+        {
+            var name = property.Name;
+            if (!(name.Equals("SourceFile", StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith(":SourceFile", StringComparison.OrdinalIgnoreCase))) continue;
+            sourcePath = JsonValueText(property.Value);
+            if (!string.IsNullOrWhiteSpace(sourcePath)) return true;
+        }
+        sourcePath = "";
+        return false;
+    }
+
+    private static string TrimDiagnostic(string value)
+    {
+        var cleaned = Regex.Replace(value ?? "", @"\s+", " ").Trim();
+        return cleaned.Length > 350 ? cleaned[..350] + "…" : cleaned;
+    }
+
+    private static bool HasAnyTag(Dictionary<string, Dictionary<string, JsonElement>> data, string path, params string[] names)
+    {
+        return data.TryGetValue(NormalPath(path), out var record)
+            && names.Any(name => !string.IsNullOrWhiteSpace(FindTag(record, name)));
+    }
+
+    private static string ReadError(Dictionary<string, JsonElement> record)
+    {
+        return TryGetPropertyBySuffix(record, "Error", out var value) ? JsonValueText(value) : "";
+    }
+
+    private static bool TryGetPropertyBySuffix(Dictionary<string, JsonElement> record, string name, out JsonElement value)
+    {
+        foreach (var pair in record)
+        {
+            if (pair.Key.Equals(name, StringComparison.OrdinalIgnoreCase)
+                || pair.Key.EndsWith(":" + name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = pair.Value;
+                return true;
+            }
+        }
+        value = default;
+        return false;
     }
 
     private static string BuildAudioDetail(Dictionary<string, Dictionary<string, JsonElement>> data, string path)
     {
         if (!data.TryGetValue(NormalPath(path), out var record))
-            return "艺术家：未记录 | 专辑：未记录";
-        var artist = FindTag(record, "Artist", "Performer", "AlbumArtist", "Composer", "Conductor");
+            return "参与创作的艺术家：读取失败（未取得文件记录） | 专辑艺术家：未记录 | 专辑：未记录";
+        var readError = ReadError(record);
+        if (!string.IsNullOrWhiteSpace(readError))
+            return $"参与创作的艺术家：读取失败（{readError}） | 专辑艺术家：未记录 | 专辑：未记录";
+
+        // Windows Explorer's contributing-artists property is System.Music.Artist.
+        // It corresponds primarily to the Artist tag (ID3 TPE1 / Vorbis ARTIST / MP4 Artist).
+        // AlbumArtist is intentionally shown separately rather than mislabeled as a contributor.
+        var artists = FindTag(record, "Artist", "Artists");
+        var albumArtist = FindTag(record, "AlbumArtist", "Band");
+        var performer = FindTag(record, "Performer", "InterpretedBy");
+        var originalArtist = FindTag(record, "OriginalArtist");
         var album = FindTag(record, "Album");
-        return $"艺术家：{ValueOrMissing(artist)} | 专辑：{ValueOrMissing(album)}";
+        var composer = FindTag(record, "Composer");
+        var conductor = FindTag(record, "Conductor");
+        var parts = new List<string>
+        {
+            $"参与创作的艺术家：{ValueOrMissing(artists)}",
+            $"专辑艺术家 / 乐队：{ValueOrMissing(albumArtist)}",
+            $"专辑：{ValueOrMissing(album)}"
+        };
+        if (!string.IsNullOrWhiteSpace(performer)) parts.Add("表演者：" + ValueOrMissing(performer));
+        if (!string.IsNullOrWhiteSpace(originalArtist)) parts.Add("原始艺术家：" + ValueOrMissing(originalArtist));
+        if (!string.IsNullOrWhiteSpace(composer)) parts.Add("作曲家：" + ValueOrMissing(composer));
+        if (!string.IsNullOrWhiteSpace(conductor)) parts.Add("指挥：" + ValueOrMissing(conductor));
+        return string.Join(" | ", parts);
     }
 
     private static string BuildPhotoDetail(Dictionary<string, Dictionary<string, JsonElement>> data, string path)
     {
         if (!data.TryGetValue(NormalPath(path), out var record))
-            return "拍摄时间：未记录";
-        var capture = FindTag(record, "SubSecDateTimeOriginal", "DateTimeOriginal", "CreateDate",
-            "DateTimeDigitized", "DateCreated", "MediaCreateDate");
-        return $"拍摄时间：{(string.IsNullOrWhiteSpace(capture) ? "未记录" : NormalizeDate(capture))}";
+            return "拍摄时间：读取失败（未取得文件记录） | 摄影者：未记录";
+        var readError = ReadError(record);
+        if (!string.IsNullOrWhiteSpace(readError))
+            return $"拍摄时间：读取失败（{readError}） | 摄影者：未记录";
+
+        var capture = FindTag(record, "SubSecDateTimeOriginal", "DateTimeOriginal", "DateCreated",
+            "DigitalCreationDateTime", "DateTimeCreated", "CreateDate", "DateTimeDigitized",
+            "MediaCreateDate", "TrackCreateDate", "CreationDate", "GPSDateTime", "DateTime");
+        // IPTC IIM stores DateCreated and TimeCreated as two separate tags.
+        if (!string.IsNullOrWhiteSpace(capture) && !Regex.IsMatch(capture, @"[ T]\d{1,2}:\d{2}:\d{2}"))
+        {
+            var timeCreated = FindTag(record, "TimeCreated");
+            if (!string.IsNullOrWhiteSpace(timeCreated)) capture += " " + timeCreated;
+        }
+        var offset = FindTag(record, "OffsetTimeOriginal", "OffsetTimeDigitized", "OffsetTime");
+        var captureText = string.IsNullOrWhiteSpace(capture) ? "未记录" : NormalizeDate(capture, offset);
+        var author = FindTag(record, "Artist", "Creator", "By-line", "Author", "XPAuthor", "Credit");
+        return $"拍摄时间：{captureText} | 摄影者：{ValueOrMissing(author)}";
     }
 
     private static string BuildVideoDetail(string path, string mediaInfo)
@@ -467,15 +660,26 @@ internal static class ScanService
     {
         foreach (var name in names)
         {
+            var wanted = NormalizeTagName(name);
             foreach (var pair in record)
             {
-                var normalized = pair.Key.Split(':').Last().Replace("_", "", StringComparison.Ordinal).Trim();
-                if (!normalized.Equals(name, StringComparison.OrdinalIgnoreCase)) continue;
+                // -G1 produces keys such as "ID3:Artist" or "XMP:DateCreated".
+                // Compare the tag suffix, ignoring punctuation/casing differences.
+                var key = NormalizeTagName(pair.Key.Split(':').Last());
+                if (!key.Equals(wanted, StringComparison.Ordinal)) continue;
                 var value = JsonValueText(pair.Value);
                 if (!string.IsNullOrWhiteSpace(value)) return value;
             }
         }
         return "";
+    }
+
+    private static string NormalizeTagName(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        foreach (var ch in value)
+            if (char.IsLetterOrDigit(ch)) builder.Append(char.ToUpperInvariant(ch));
+        return builder.ToString();
     }
 
     private static string JsonValueText(JsonElement value)
@@ -487,16 +691,25 @@ internal static class ScanService
             JsonValueKind.Number => value.ToString(),
             JsonValueKind.True => "是",
             JsonValueKind.False => "否",
-            _ => ""
+                _ => ""
         };
     }
 
     private static string ValueOrMissing(string value) => string.IsNullOrWhiteSpace(value) ? "未记录" : Regex.Replace(value, @"\s+", " ").Trim();
 
-    private static string NormalizeDate(string value)
+    private static string NormalizeDate(string value, string offset)
     {
-        var text = Regex.Replace(value.Trim(), @"^(\d{4}):(\d{2}):(\d{2})", "$1-$2-$3");
-        return text.Replace('T', ' ');
+        var text = value.Trim().Replace('T', ' ');
+        text = Regex.Replace(text, @"^(\d{4}):(\d{2}):(\d{2})", "$1-$2-$3");
+        if (!string.IsNullOrWhiteSpace(offset)
+            && !Regex.IsMatch(text, @"(?:Z|[+-]\d{2}:?\d{2})$", RegexOptions.IgnoreCase))
+        {
+            var normalizedOffset = offset.Trim();
+            if (Regex.IsMatch(normalizedOffset, @"^[+-]\d{4}$"))
+                normalizedOffset = normalizedOffset.Insert(3, ":");
+            if (Regex.IsMatch(normalizedOffset, @"^[+-]\d{2}:\d{2}$")) text += " " + normalizedOffset;
+        }
+        return text;
     }
 
     private static string FormatBitrate(string raw)
@@ -617,7 +830,14 @@ internal static class ScanService
         }
     }
 
-    private static void WriteTextReport(string path, string folder, List<FileEntry> entries)
+    private static void WriteTextReport(
+        string path,
+        string folder,
+        List<FileEntry> entries,
+        int metadataRecords,
+        int metadataRequested,
+        string metadataSummary,
+        List<string> metadataDiagnostics)
     {
         var lines = new List<string>
         {
@@ -625,9 +845,18 @@ internal static class ScanService
             $"扫描目录：{folder}",
             $"生成时间：{DateTime.Now:yyyy-MM-dd HH:mm:ss}",
             $"文件数量：{entries.Count}",
-            new string('=', 72),
-            ""
+            $"元数据读取：ExifTool 返回 {metadataRecords}/{metadataRequested} 个文件记录",
+            $"元数据识别：{metadataSummary}"
         };
+        if (metadataDiagnostics.Count > 0)
+        {
+            lines.Add("元数据读取警告：");
+            lines.AddRange(metadataDiagnostics.Take(12).Select(message => "  - " + message));
+            if (metadataDiagnostics.Count > 12)
+                lines.Add($"  - 另有 {metadataDiagnostics.Count - 12} 条警告，请查看程序运行记录。");
+        }
+        lines.Add(new string('=', 72));
+        lines.Add("");
         foreach (var entry in entries)
         {
             var line = entry.RelativePath;
