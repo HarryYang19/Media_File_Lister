@@ -188,12 +188,35 @@ jobs:
             -p:DebugSymbols=false `
             -o $publish
           if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
-          if (-not (Test-Path (Join-Path $publish '媒体文件清单.exe'))) { throw 'The self-contained application EXE was not produced.' }
-          $bundledExif = Get-ChildItem -Path (Join-Path $publish 'tools') -Recurse -File -Filter 'exiftool.exe' | Select-Object -First 1
-          $bundledMediaInfo = Get-ChildItem -Path (Join-Path $publish 'tools') -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
-          if (-not $bundledExif -or -not $bundledMediaInfo) { throw 'Metadata tools were not copied into the publish folder.' }
+          $appExe = Join-Path $publish '媒体文件清单.exe'
+          if (-not (Test-Path $appExe -PathType Leaf)) { throw "The self-contained application EXE was not produced: $appExe" }
+
+          # IMPORTANT: tools are downloaded AFTER checkout. Depending on SDK/MSBuild
+          # item evaluation and single-file publish behavior, the csproj content glob
+          # is not a reliable way to stage those late-arriving binaries. Copy the
+          # complete tools tree explicitly after dotnet publish instead.
+          $sourceTools = Join-Path (Split-Path $project -Parent) 'tools'
+          $publishTools = Join-Path $publish 'tools'
+          $sourceExif = Get-ChildItem -Path $sourceTools -Recurse -File -Filter 'exiftool.exe' | Select-Object -First 1
+          $sourceExifSupport = if ($sourceExif) { Join-Path $sourceExif.DirectoryName 'exiftool_files' } else { $null }
+          $sourceMediaInfo = Get-ChildItem -Path $sourceTools -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
+          if (-not $sourceExif -or -not $sourceExifSupport -or -not (Test-Path $sourceExifSupport -PathType Container)) {
+            throw "Source ExifTool package is incomplete. Expected exiftool.exe and sibling exiftool_files directory under $sourceTools"
+          }
+          if (-not $sourceMediaInfo) { throw "Source MediaInfo CLI executable is missing under $sourceTools" }
+
+          if (Test-Path $publishTools) { Remove-Item -LiteralPath $publishTools -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $publishTools | Out-Null
+          Get-ChildItem -LiteralPath $sourceTools -Force | Copy-Item -Destination $publishTools -Recurse -Force
+
+          $bundledExif = Get-ChildItem -Path $publishTools -Recurse -File -Filter 'exiftool.exe' | Select-Object -First 1
+          $bundledMediaInfo = Get-ChildItem -Path $publishTools -Recurse -File | Where-Object { $_.Name -ieq 'MediaInfo.exe' -or $_.Name -ieq 'mediainfo.exe' } | Select-Object -First 1
+          if (-not $bundledExif -or -not $bundledMediaInfo) { throw "Metadata tools were not staged into publish. Source: $sourceTools; destination: $publishTools" }
+          $bundledExifSupport = Join-Path $bundledExif.DirectoryName 'exiftool_files'
+          if (-not (Test-Path $bundledExifSupport -PathType Container)) { throw "Published ExifTool support folder is missing: $bundledExifSupport" }
           Write-Host "Published ExifTool: $((& $bundledExif.FullName -ver | Out-String).Trim())"
-          Write-Host "Published MediaInfo: $((& $bundledMediaInfo.FullName --Version | Out-String).Trim())"
+          Write-Host "Published MediaInfo: $((& $bundledMediaInfo.FullName --Version 2>&1 | Out-String).Trim())"
+          Write-Host "Published metadata files: $((Get-ChildItem -Path $publishTools -Recurse -File | Measure-Object).Count)"
 
           # Copy notices next to the executable. Keep the helper folders as part of the ZIP.
           $licenseSource = Join-Path $env:GITHUB_WORKSPACE 'src\MediaFileLister\LICENSES'
@@ -207,6 +230,24 @@ jobs:
           Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $zip -CompressionLevel Optimal
           Write-Host "Created $zip"
           Get-Item $zip | Format-List Name, Length
+
+          # Validate the actual ZIP, not just the staging directory.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $entryNames = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            $zipExif = $entryNames | Where-Object { $_ -match '(^|/)tools/ExifTool/(.*/)?exiftool\.exe$' } | Select-Object -First 1
+            $zipMedia = $entryNames | Where-Object { $_ -match '(^|/)tools/MediaInfo/.*/?(MediaInfo|mediainfo)\.exe$' } | Select-Object -First 1
+            $zipExifSupport = $entryNames | Where-Object { $_ -match '(^|/)tools/ExifTool/(.*/)?exiftool_files/.+' } | Select-Object -First 1
+            if (-not $zipExif -or -not $zipMedia -or -not $zipExifSupport) {
+              throw "Final ZIP is missing metadata tools. ExifTool=$zipExif; MediaInfo=$zipMedia; ExifTool support=$zipExifSupport"
+            }
+            if (-not ($entryNames | Where-Object { $_ -match '(^|/)媒体文件清单\.exe$' })) {
+              throw 'Final ZIP is missing 媒体文件清单.exe.'
+            }
+            Write-Host "Final ZIP validation passed: $zipExif; $zipMedia; ExifTool support files present."
+          }
+          finally { $archive.Dispose() }
 
       - name: Upload portable ZIP artifact
         uses: actions/upload-artifact@v4
