@@ -15,12 +15,5 @@
     <InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>
 
-  <!-- Build workflow downloads these folders before publishing. -->
-  <ItemGroup>
-    <Content Include="tools\**\*">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-      <TargetPath>tools\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
-    </Content>
-  </ItemGroup>
+  <!-- Third-party tools are staged explicitly by build-windows.yml after publish. -->
 </Project>
